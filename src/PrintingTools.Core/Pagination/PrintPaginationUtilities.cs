@@ -771,7 +771,6 @@ public static class PrintPaginationUtilities
         }
 
         var pageCount = Math.Max(1, (int)Math.Ceiling(remainingHeight / availableHeight));
-        var maxOffset = Math.Max(visualHeight - availableHeight, 0);
         var basePageBreak = page.IsPageBreakAfter;
 
         // Splitting a visual across pages is worth the full set of numbers: page size, margins,
@@ -793,10 +792,13 @@ public static class PrintPaginationUtilities
                 pageCount
             });
 
+        // Each slice starts at an exact multiple of the available height, so no page re-renders
+        // content already shown on an earlier one. Pulling the last slice back to the content
+        // bottom (a maxOffset clamp) duplicated most of the previous page whenever content
+        // spilled only slightly over a page; trailing whitespace on the last sheet is correct.
         for (var index = 0; index < pageCount; index++)
         {
             var offsetY = baseOffset.Y + index * availableHeight;
-            offsetY = Math.Min(offsetY, maxOffset);
 
             var offset = new Point(baseOffset.X, offsetY);
             var sliceMetrics = index == 0 && offset.Equals(metrics.ContentOffset)
