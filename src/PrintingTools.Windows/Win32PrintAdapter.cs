@@ -148,7 +148,7 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
         var preview = PrintPreviewModel.Create(
             session,
             TargetPreviewDpi,
-            includeBitmaps: true,
+            includeBitmaps: !includeVector, // vector preview consumes Pages + VectorDocument only; skip the discarded per-page rasterization
             includeVectorDocument: includeVector,
             vectorRenderer: includeVector ? _vectorRenderer : null,
             cancellationToken);
