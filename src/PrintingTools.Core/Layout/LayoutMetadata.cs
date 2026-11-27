@@ -12,6 +12,7 @@ public readonly struct LayoutMetadata
     private LayoutMetadata(
         PrintLayoutKind kind,
         PageOrientation orientation,
+        PageMediaSize? mediaSize,
         int nUpRows,
         int nUpColumns,
         NUpPageOrder nUpOrder,
@@ -21,6 +22,7 @@ public readonly struct LayoutMetadata
     {
         Kind = kind;
         Orientation = orientation;
+        MediaSize = mediaSize;
         NUpRows = Math.Max(1, nUpRows);
         NUpColumns = Math.Max(1, nUpColumns);
         NUpOrder = nUpOrder;
@@ -38,6 +40,16 @@ public readonly struct LayoutMetadata
     /// correctly-oriented XPS pages get rotated/clipped by a portrait-default driver.
     /// </summary>
     public PageOrientation Orientation { get; }
+    
+    /// <summary>
+    /// Page media size carried through from <see cref="PrintTicketModel.PageMediaSize"/>.
+    /// Windows adapters use this to pin <c>DEVMODE.dmPaperSize</c> (or <c>DMPAPER_USER</c> with
+    /// explicit length/width) so the sheet the driver spools on is the sheet the XPS pages were
+    /// laid out for; without it only <c>dmOrientation</c> travels, and drivers that reconcile a
+    /// job against the loaded tray answer the half-specified request with their document
+    /// properties dialog instead of spooling silently.
+    /// </summary>
+    public PageMediaSize? MediaSize { get; }
     
     public int NUpRows { get; }
 
@@ -90,6 +102,7 @@ public readonly struct LayoutMetadata
         return new LayoutMetadata(
             kind,
             ticket.Orientation,
+            ticket.PageMediaSize,
             nUpRows,
             nUpColumns,
             nUpOrder,

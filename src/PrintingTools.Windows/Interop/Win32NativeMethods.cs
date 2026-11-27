@@ -253,6 +253,32 @@ internal static partial class Win32NativeMethods
     [LibraryImport(WinSpool, EntryPoint = "DocumentPropertiesW", SetLastError = true, StringMarshalling = StringMarshalling.Utf16)]
     internal static partial int DocumentProperties(IntPtr hwnd, IntPtr hPrinter, string pDeviceName, IntPtr pDevModeOutput, IntPtr pDevModeInput, int fMode);
 
+    /// <summary>
+    /// DocumentProperties for silent submission paths. Refuses any fMode that carries DM_PROMPT:
+    /// that single bit is what instructs the driver to put up its document-properties dialog,
+    /// and a silent print must never raise one (measured on KONICA MINOLTA C287SeriesPCL, where
+    /// asking for the driver's default DEVMODE with the prompt bit set produced a full-page job
+    /// settings confirmation on every print). Fail loudly instead of silently re-introducing the
+    /// dialog, so a mistyped constant cannot come back as a runtime behaviour change.
+    /// </summary>
+    internal static int DocumentPropertiesNoPrompt(
+        IntPtr hwnd,
+        IntPtr hPrinter,
+        string pDeviceName,
+        IntPtr pDevModeOutput,
+        IntPtr pDevModeInput,
+        int fMode)
+    {
+        if ((fMode & DM_PROMPT) != 0)
+        {
+            throw new ArgumentException(
+                $"DocumentProperties must not request the driver property sheet (fMode 0x{fMode:X} carries DM_PROMPT).",
+                nameof(fMode));
+        }
+
+        return DocumentProperties(hwnd, hPrinter, pDeviceName, pDevModeOutput, pDevModeInput, fMode);
+    }
+
     [LibraryImport("comdlg32.dll", EntryPoint = "PrintDlgExW", SetLastError = true)]
     internal static partial int PrintDlgEx(ref PRINTDLGEX dialog);
 
@@ -357,6 +383,9 @@ internal static partial class Win32NativeMethods
     }
 
     internal const int DM_ORIENTATION = 0x00000001;
+    internal const int DM_PAPERSIZE = 0x00000002;
+    internal const int DM_PAPERLENGTH = 0x00000004;
+    internal const int DM_PAPERWIDTH = 0x00000008;
     internal const int DM_COPIES = 0x00000100;
     internal const int DM_COLOR = 0x00000800;
     internal const int DM_DUPLEX = 0x00001000;
@@ -364,15 +393,35 @@ internal static partial class Win32NativeMethods
     internal const short DMORIENT_PORTRAIT = 1;
     internal const short DMORIENT_LANDSCAPE = 2;
 
+    // DEVMODE.dmPaperSize form codes (wingdi.h). DMPAPER_USER asks the driver to take the
+    // sheet dimensions from dmPaperWidth/dmPaperLength (tenths of a millimetre) instead.
+    internal const short DMPAPER_LETTER = 1;
+    internal const short DMPAPER_TABLOID = 3;
+    internal const short DMPAPER_LEGAL = 5;
+    internal const short DMPAPER_A3 = 8;
+    internal const short DMPAPER_A4 = 9;
+    internal const short DMPAPER_A5 = 11;
+    internal const short DMPAPER_USER = 256;
+
     internal const short DMDUP_SIMPLEX = 1;
-    internal const short DMDUP_HORIZONTAL = 2;
-    internal const short DMDUP_VERTICAL = 3;
+    // wingdi.h: DMDUP_VERTICAL = 2 (flip on long edge), DMDUP_HORIZONTAL = 3 (flip on short
+    // edge). These two used to carry each other's value; the call sites were written against the
+    // wrong table too, so the numbers on the wire happened to land right by double inversion.
+    // Values are now in header order - re-check every name-based use when touching this block.
+    internal const short DMDUP_VERTICAL = 2;
+    internal const short DMDUP_HORIZONTAL = 3;
 
     internal const short DMCOLOR_MONOCHROME = 1;
     internal const short DMCOLOR_COLOR = 2;
 
+    // DocumentProperties fMode bits, WinDef.h is the authority:
+    //   DM_UPDATE 1, DM_COPY 2, DM_PROMPT 4, DM_MODIFY 8
+    //   DM_OUT_BUFFER = DM_COPY (2), DM_IN_BUFFER = DM_MODIFY (8), DM_IN_PROMPT = DM_PROMPT (4)
+    //   DM_OUT_DEFAULT = DM_UPDATE (1)
+    // DM_PROMPT is the one bit that makes the driver put up its document-properties dialog.
     internal const int DM_OUT_BUFFER = 0x00000002;
-    internal const int DM_OUT_DEFAULT = 0x00000004;
+    internal const int DM_PROMPT = 0x00000004;
+    internal const int DM_OUT_DEFAULT = 0x00000001;
     internal const int DM_IN_BUFFER = 0x00000008;
     internal const int DM_NUP = 0x00000040;
 

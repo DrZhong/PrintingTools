@@ -213,6 +213,8 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
             return;
         }
 
+        var layoutMetadata = LayoutMetadata.FromTicket(session.Ticket);
+
         var xpsBytes = _xpsExporter.CreateXpsBytes(pages, rasterBitmaps);
         if (xpsBytes.Length == 0)
         {
@@ -220,8 +222,6 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
             DisposeBitmaps(rasterBitmaps);
             return;
         }
-
-        var layoutMetadata = LayoutMetadata.FromTicket(session.Ticket);
 
         if (!TrySubmitXpsJob(session, printerName, jobName, xpsBytes, layoutMetadata, out var jobId))
         {
@@ -463,8 +463,10 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
         {
             ticket.Duplex = devMode.dmDuplex switch
             {
-                Win32NativeMethods.DMDUP_HORIZONTAL => DuplexingMode.TwoSidedLongEdge,
-                Win32NativeMethods.DMDUP_VERTICAL => DuplexingMode.TwoSidedShortEdge,
+                // wingdi.h: DMDUP_VERTICAL (2) flips on the long edge, DMDUP_HORIZONTAL (3) on the
+                // short one - the names describe the axis of the flip, not the binding edge.
+                Win32NativeMethods.DMDUP_VERTICAL => DuplexingMode.TwoSidedLongEdge,
+                Win32NativeMethods.DMDUP_HORIZONTAL => DuplexingMode.TwoSidedShortEdge,
                 _ => DuplexingMode.OneSided
             };
         }
@@ -601,7 +603,7 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
 
         try
         {
-            if (TryCreateLayoutDevMode(printer.DangerousGetHandle(), printerName, layout, out originalDevMode, out updatedDevMode))
+            if (PrepareLayoutDevMode(printer.DangerousGetHandle(), printerName, layout, out originalDevMode, out updatedDevMode))
             {
                 printerInfoPtr = Marshal.AllocHGlobal(Marshal.SizeOf<Win32NativeMethods.PRINTER_INFO_9>());
                 Marshal.StructureToPtr(new Win32NativeMethods.PRINTER_INFO_9 { pDevMode = updatedDevMode }, printerInfoPtr, fDeleteOld: false);
@@ -786,7 +788,12 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int GetJobStatusMethod(IntPtr job, IntPtr status);
 
-    private static bool TryCreateLayoutDevMode(IntPtr printerHandle, string printerName, LayoutMetadata layout, out IntPtr originalDevMode, out IntPtr updatedDevMode)
+    /// <summary>
+    /// Builds the per-job DEVMODE (paper + orientation + N-up + booklet duplex pinned onto the
+    /// driver's default) used by the XPS submission path. The caller owns both
+    /// handles and must free them; on failure both come back as IntPtr.Zero.
+    /// </summary>
+    private static bool PrepareLayoutDevMode(IntPtr printerHandle, string printerName, LayoutMetadata layout, out IntPtr originalDevMode, out IntPtr updatedDevMode)
     {
         originalDevMode = IntPtr.Zero;
         updatedDevMode = IntPtr.Zero;
@@ -804,7 +811,11 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
         originalDevMode = Marshal.AllocHGlobal(size);
         updatedDevMode = Marshal.AllocHGlobal(size);
 
-        if (Win32NativeMethods.DocumentProperties(IntPtr.Zero, printerHandle, printerName, originalDevMode, IntPtr.Zero, Win32NativeMethods.DM_OUT_BUFFER | Win32NativeMethods.DM_OUT_DEFAULT) < 0)
+        // "Get the current printer settings" per the DocumentProperties remarks: DM_OUT_BUFFER and
+        // nothing else. DM_OUT_DEFAULT used to be ORed in with the wrong value (0x4 = DM_PROMPT),
+        // which asked the driver to show its property sheet - that is where the KM job-settings
+        // dialog on every silent print came from.
+        if (Win32NativeMethods.DocumentPropertiesNoPrompt(IntPtr.Zero, printerHandle, printerName, originalDevMode, IntPtr.Zero, Win32NativeMethods.DM_OUT_BUFFER) < 0)
         {
             PrintDiagnostics.Report(
                 DiagnosticsCategory,
@@ -871,6 +882,35 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
             modified = true;
         }
     
+        // Paper travels together with orientation: a DEVMODE that only flips dmOrientation leaves
+        // dmPaperSize on whatever the queue defaults to, so the driver is handed a rotated sheet
+        // of an unspecified form. Drivers that reconcile the job against the loaded tray (seen on
+        // Konica Minolta queues) answer that half-specified request with their document-properties
+        // dialog instead of spooling silently. Pinning the form the ticket asks for — a known
+        // DMPAPER_* code, or DMPAPER_USER with explicit edges — makes the request complete.
+        if (TryMapMediaToPaper(layout.MediaSize, out var paperSize, out var paperWidth, out var paperLength, out var paperFields))
+        {
+            const uint allPaperFields =
+                (uint)(Win32NativeMethods.DM_PAPERSIZE | Win32NativeMethods.DM_PAPERWIDTH | Win32NativeMethods.DM_PAPERLENGTH);
+    
+            var dimensionsDiffer = (paperFields & (uint)Win32NativeMethods.DM_PAPERWIDTH) != 0
+                && (devMode.dmPaperWidth != paperWidth || devMode.dmPaperLength != paperLength);
+    
+            if ((devMode.dmFields & allPaperFields) != paperFields
+                || devMode.dmPaperSize != paperSize
+                || dimensionsDiffer)
+            {
+                // Write the full paper triple so bits and values never disagree: a standard form
+                // clears the width/length bits (the driver refills them during the
+                // DocumentProperties reconciliation below), a custom form sets all three.
+                devMode.dmFields = (devMode.dmFields & ~allPaperFields) | paperFields;
+                devMode.dmPaperSize = paperSize;
+                devMode.dmPaperWidth = paperWidth;
+                devMode.dmPaperLength = paperLength;
+                modified = true;
+            }
+        }
+    
         if ((devMode.dmFields & (uint)Win32NativeMethods.DM_NUP) != 0)
         {
             devMode.dmFields &= ~(uint)Win32NativeMethods.DM_NUP;
@@ -894,9 +934,11 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
 
         if (layout.Kind == PrintLayoutKind.Booklet)
         {
+            // Booklet binding follows wingdi.h: long-edge binding is DMDUP_VERTICAL (2),
+            // short-edge binding is DMDUP_HORIZONTAL (3).
             var desiredDuplex = layout.BookletBindLongEdge
-                ? Win32NativeMethods.DMDUP_HORIZONTAL
-                : Win32NativeMethods.DMDUP_VERTICAL;
+                ? Win32NativeMethods.DMDUP_VERTICAL
+                : Win32NativeMethods.DMDUP_HORIZONTAL;
 
             if ((devMode.dmFields & (uint)Win32NativeMethods.DM_DUPLEX) == 0 || devMode.dmDuplex != desiredDuplex)
             {
@@ -928,6 +970,95 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
         
         return modified;
     }
+
+    /// <summary>
+    /// Sheet forms every in-box Windows driver knows, portrait edges in millimetres.
+    /// </summary>
+    private static readonly (short Code, double ShortEdgeMm, double LongEdgeMm)[] StandardPaperForms =
+    [
+        (Win32NativeMethods.DMPAPER_LETTER, 215.9, 279.4),
+        (Win32NativeMethods.DMPAPER_LEGAL, 215.9, 355.6),
+        (Win32NativeMethods.DMPAPER_TABLOID, 279.4, 431.8),
+        (Win32NativeMethods.DMPAPER_A3, 297.0, 420.0),
+        (Win32NativeMethods.DMPAPER_A4, 210.0, 297.0),
+        (Win32NativeMethods.DMPAPER_A5, 148.0, 210.0),
+    ];
+
+    /// <summary>
+    /// Maps a ticket media size onto the DEVMODE paper fields: named forms get their DMPAPER_*
+    /// code alone (width/length bits stay cleared), anything else becomes DMPAPER_USER with
+    /// explicit edges in tenths of a millimetre. Returns false — leaving the paper untouched —
+    /// when no media is carried, the unit is neither Points nor Millimeters, or the edges are
+    /// not finite/positive or overflow the short range: the adapter never guesses a sheet.
+    /// </summary>
+    private static bool TryMapMediaToPaper(
+        PageMediaSize? media,
+        out short paperSize,
+        out short paperWidth,
+        out short paperLength,
+        out uint paperFields)
+    {
+        paperSize = 0;
+        paperWidth = 0;
+        paperLength = 0;
+        paperFields = 0;
+
+        if (media is null)
+        {
+            return false;
+        }
+
+        double widthMm;
+        double heightMm;
+        if (media.Unit.Equals("Points", StringComparison.OrdinalIgnoreCase))
+        {
+            widthMm = media.Width * 25.4 / 72;
+            heightMm = media.Height * 25.4 / 72;
+        }
+        else if (media.Unit.Equals("Millimeters", StringComparison.OrdinalIgnoreCase))
+        {
+            widthMm = media.Width;
+            heightMm = media.Height;
+        }
+        else
+        {
+            return false;
+        }
+
+        if (!double.IsFinite(widthMm) || !double.IsFinite(heightMm) || widthMm <= 0 || heightMm <= 0)
+        {
+            return false;
+        }
+
+        // Tickets carry the portrait base sheet, but match the unordered pair too: a producer
+        // that already swapped the edges for landscape must still land on the same form code.
+        // Half a millimetre of tolerance absorbs point rounding (A4 = 595 x 842 pt ≈ 209.9 x 297.0 mm).
+        foreach (var form in StandardPaperForms)
+        {
+            if ((NearlyEqual(widthMm, form.ShortEdgeMm) && NearlyEqual(heightMm, form.LongEdgeMm))
+                || (NearlyEqual(widthMm, form.LongEdgeMm) && NearlyEqual(heightMm, form.ShortEdgeMm)))
+            {
+                paperSize = form.Code;
+                paperFields = (uint)Win32NativeMethods.DM_PAPERSIZE;
+                return true;
+            }
+        }
+
+        var widthTenthMm = (int)Math.Round(widthMm * 10);
+        var lengthTenthMm = (int)Math.Round(heightMm * 10);
+        if (widthTenthMm is < 1 or > short.MaxValue || lengthTenthMm is < 1 or > short.MaxValue)
+        {
+            return false;
+        }
+
+        paperSize = Win32NativeMethods.DMPAPER_USER;
+        paperWidth = (short)widthTenthMm;
+        paperLength = (short)lengthTenthMm;
+        paperFields = (uint)(Win32NativeMethods.DM_PAPERSIZE | Win32NativeMethods.DM_PAPERWIDTH | Win32NativeMethods.DM_PAPERLENGTH);
+        return true;
+    }
+
+    private static bool NearlyEqual(double a, double b) => Math.Abs(a - b) <= 0.5;
 
     private static void DisposeBitmaps(IReadOnlyList<RenderTargetBitmap>? bitmaps)
     {
@@ -962,11 +1093,31 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
 
             try
             {
-                if (!TryGetJob(printer.DangerousGetHandle(), jobId, ref buffer, out var initialInfo))
+                // A submission whose document stream was fully written and closed has already
+                // handed the whole document to the print processor; the queue can then drop the
+                // job within milliseconds (fast print + auto-remove), so one failed GetJob right
+                // after submission proves nothing. Retry briefly before declaring the job unqueryable.
+                var initialInfo = default(Win32NativeMethods.JOB_INFO_2);
+                var initialQueried = false;
+                for (var attempt = 0; attempt < 4; attempt++)
+                {
+                    if (attempt > 0)
+                    {
+                        await Task.Delay(250, cancellationToken).ConfigureAwait(false);
+                    }
+
+                    if (TryGetJob(printer.DangerousGetHandle(), jobId, ref buffer, out initialInfo))
+                    {
+                        initialQueried = true;
+                        break;
+                    }
+                }
+
+                if (!initialQueried)
                 {
                     PrintDiagnostics.Report(
                         DiagnosticsCategory,
-                        "Monitor: initial GetJob failed; assuming completion.",
+                        "Monitor: job not queryable after retries; submission itself succeeded, treating as spooled.",
                         context: new { Printer = printerName, JobId = jobId, Error = Win32NativeMethods.GetLastErrorMessage() });
                     session.NotifyJobEvent(PrintJobEventKind.Unknown, $"Unable to query job {jobId} on '{printerName}'.");
                     return;
@@ -1230,10 +1381,10 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
             {
                 switch (devMode.dmDuplex)
                 {
-                    case Win32NativeMethods.DMDUP_HORIZONTAL:
+                    case Win32NativeMethods.DMDUP_VERTICAL:
                         duplexSupport |= DuplexingSupport.LongEdge;
                         break;
-                    case Win32NativeMethods.DMDUP_VERTICAL:
+                    case Win32NativeMethods.DMDUP_HORIZONTAL:
                         duplexSupport |= DuplexingSupport.ShortEdge;
                         break;
                 }
@@ -1310,7 +1461,7 @@ internal sealed class Win32PrintAdapter : IPrintAdapter
         var buffer = Marshal.AllocHGlobal(size);
         try
         {
-            int result = Win32NativeMethods.DocumentProperties(IntPtr.Zero, printerHandle, printerName, buffer, IntPtr.Zero, Win32NativeMethods.DM_OUT_BUFFER | Win32NativeMethods.DM_OUT_DEFAULT);
+            int result = Win32NativeMethods.DocumentPropertiesNoPrompt(IntPtr.Zero, printerHandle, printerName, buffer, IntPtr.Zero, Win32NativeMethods.DM_OUT_BUFFER);
             if (result < 0)
             {
                 return false;
